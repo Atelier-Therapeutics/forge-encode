@@ -1,0 +1,8 @@
+include README.md
+include LICENSE
+include pyproject.toml
+include setup.py
+recursive-include forge_encode *.py
+recursive-include tests *.py
+recursive-exclude * __pycache__
+recursive-exclude * *.py[co] 

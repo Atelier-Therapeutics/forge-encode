@@ -1,0 +1,18 @@
+# Development dependencies
+pytest>=6.0
+pytest-cov>=2.0
+black>=21.0
+flake8>=3.8
+mypy>=0.800
+setuptools>=45
+wheel
+setuptools_scm[toml]>=6.2
+
+# Core dependencies for molecular encoding
+rdkit-pypi>=2021.9.1
+torch>=1.9.0
+networkx>=2.5
+tqdm>=4.60.0
+
+# Add your main dependencies here when ready
+# numpy>=1.21.0 

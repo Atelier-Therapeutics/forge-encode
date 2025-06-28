@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forge-encode"
+dynamic = ["version"]
+description = "Various encoding and VAE schemes for molecules, data and interactions"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "your.email@example.com"},
+]
+maintainers = [
+    {name = "Your Name", email = "your.email@example.com"},
+]
+keywords = ["molecular", "encoding", "vae", "machine-learning", "chemistry"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Chemistry",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "rdkit-pypi>=2021.9.1",
+    "torch>=1.9.0",
+    "networkx>=2.5",
+    "tqdm>=4.60.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov>=2.0",
+    "black>=21.0",
+    "flake8>=3.8",
+    "mypy>=0.800",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/forge-encode"
+Repository = "https://github.com/yourusername/forge-encode"
+Documentation = "https://github.com/yourusername/forge-encode#readme"
+"Bug Tracker" = "https://github.com/yourusername/forge-encode/issues"
+
+[tool.setuptools_scm]
+write_to = "forge_encode/_version.py"
+
+[tool.black]
+line-length = 88
+target-version = ['py38']
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"] 
