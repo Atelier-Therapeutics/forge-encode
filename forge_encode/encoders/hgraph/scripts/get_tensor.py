@@ -23,6 +23,14 @@ import multiprocessing as mp
 import os
 import signal
 import atexit
+import gc
+
+# Configure PyTorch multiprocessing to prevent file descriptor issues
+torch.multiprocessing.set_sharing_strategy('file_system')
+
+# Additional PyTorch multiprocessing settings to prevent memory issues
+os.environ['OMP_NUM_THREADS'] = '1'  # Prevent OpenMP from spawning too many threads
+os.environ['MKL_NUM_THREADS'] = '1'  # Prevent MKL from spawning too many threads
 
 # Add the parent directory to the path so we can import from forge_encode
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent))
@@ -40,8 +48,58 @@ except ImportError as e:
     print(f"Error importing forge_encode: {e}")
     sys.exit(1)
 
+def increase_file_descriptor_limit():
+    """Try to increase file descriptor limit to prevent 'Too many open files' errors"""
+    try:
+        import resource
+        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        
+        # Try to increase to hard limit or a reasonable value
+        target_limit = min(hard_limit, 65536)  # Cap at 65536 to be safe
+        
+        if soft_limit < target_limit:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target_limit, hard_limit))
+            new_soft, new_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            print(f"Increased file descriptor limit from {soft_limit} to {new_soft}")
+            return new_soft
+        else:
+            print(f"File descriptor limit already sufficient: {soft_limit}")
+            return soft_limit
+    except Exception as e:
+        print(f"Warning: Could not increase file descriptor limit: {e}")
+        return None
+
 # Global variable to track active pools for cleanup
 _active_pools = []
+
+def get_optimal_worker_count(requested_cpus, max_workers_per_core=2):
+    """Calculate optimal number of workers to prevent file descriptor issues"""
+    try:
+        # Get system file descriptor limit
+        import resource
+        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        
+        # Conservative estimate: each worker might use ~100 file descriptors
+        # Leave some headroom for system processes
+        max_workers_by_fd = max(1, (soft_limit // 100) - 10)
+        
+        # Also consider CPU count
+        import multiprocessing
+        cpu_count = multiprocessing.cpu_count()
+        max_workers_by_cpu = cpu_count * max_workers_per_core
+        
+        # Take the minimum to be safe
+        optimal_workers = min(requested_cpus, max_workers_by_fd, max_workers_by_cpu)
+        
+        if optimal_workers < requested_cpus:
+            print(f"Warning: Reducing workers from {requested_cpus} to {optimal_workers} to prevent file descriptor issues")
+            print(f"  File descriptor limit: {soft_limit}, CPU count: {cpu_count}")
+        
+        return optimal_workers
+    except Exception as e:
+        print(f"Warning: Could not determine optimal worker count: {e}")
+        # Fallback to conservative estimate
+        return min(requested_cpus, 8)
 
 def cleanup_pools():
     """Clean up all active multiprocessing pools"""
@@ -362,6 +420,45 @@ def process_large_batch(batch_data, encoding_type, vocab: PairVocab = None):
                     
     return successful_tensors
 
+def batch_tensorize_worker_function(args):
+    """Worker function for batch tensorization with tqdm progress bar"""
+    batch_data, vocab_file, encoding_type, worker_id = args
+    try:
+        from forge_encode.encoders.hgraph.vocab import PairVocab, common_atom_vocab
+        from forge_encode.encoders.hgraph.mol_graph import MolGraph
+        from tqdm import tqdm
+        
+        # Load vocabulary in worker process
+        with open(vocab_file, 'r') as f:
+            vocab_lines = [x.strip("\r\n ").split() for x in f]
+        worker_vocab = PairVocab(vocab_lines, cuda=False)
+        
+        molecules = batch_data.get('molecules', [])
+        batch_id = batch_data.get('batch_id', 0)
+        
+        # Add space for single-digit worker IDs to align progress bars
+        worker_display = f" {worker_id}" if worker_id < 10 else str(worker_id)
+        desc = f"Batch Tensor Worker {worker_display} (batch {batch_id}, size={len(molecules)})"
+        
+        # Tensorize the entire batch at once
+        batch_result = MolGraph.tensorize(molecules, worker_vocab, common_atom_vocab, show_progress=False)
+        
+        # Convert to numpy arrays to avoid PyTorch tensor sharing issues
+        numpy_result = to_numpy(batch_result)
+        
+        # Clean up memory
+        del batch_result, worker_vocab
+        gc.collect()
+        
+        return numpy_result
+        
+    except Exception as e:
+        batch_id = batch_data.get('batch_id', 0)
+        print(f"Error tensorizing batch {batch_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
 def tensorize_worker_function(args):
     """Worker function for tensorization with tqdm progress bar for each batch"""
     batch_data, vocab_file, encoding_type, worker_id = args
@@ -374,14 +471,23 @@ def tensorize_worker_function(args):
         atom_vocab = common_atom_vocab
         molecules = batch_data.get('molecules', [])
         batch_id = batch_data.get('batch_id', 0)
-        desc = f"Tensor Worker {worker_id} (batch {batch_id}, size={len(molecules)})"
+        # Add space for single-digit worker IDs to align progress bars
+        worker_display = f" {worker_id}" if worker_id < 10 else str(worker_id)
+        desc = f"Tensor Worker {worker_display} (batch {batch_id}, size={len(molecules)})"
         # Show a progress bar for this batch
         # Process the entire batch at once, but show a tqdm for per-molecule progress
         results = []
-        for i, smiles in enumerate(tqdm(molecules, desc=desc, position=worker_id, leave=True)):
+        for i, smiles in enumerate(tqdm(molecules, 
+                                       desc=desc, 
+                                       position=worker_id, 
+                                       leave=False,
+                                       mininterval=1.0,  # Update at least every 1 second
+                                       maxinterval=1.0)):  # Update at most every 1 second
             try:
                 tensor = MolGraph.tensorize([smiles], worker_vocab, atom_vocab, show_progress=False)
-                results.append(tensor)
+                # Convert to numpy immediately to avoid PyTorch tensor sharing issues
+                numpy_tensor = to_numpy(tensor)
+                results.append(numpy_tensor)
             except Exception:
                 continue
         return results
@@ -395,7 +501,14 @@ def simple_worker_function(args):
     smiles_list, worker_id = args
     from tqdm import tqdm
     valid_smiles = []
-    for smiles in tqdm(smiles_list, desc=f"Preprocessing Worker {worker_id}", position=worker_id, leave=True):
+    # Add space for single-digit worker IDs to align progress bars
+    worker_display = f" {worker_id}" if worker_id < 10 else str(worker_id)
+    for smiles in tqdm(smiles_list, 
+                      desc=f"Preprocessing Worker {worker_display}", 
+                      position=worker_id, 
+                      leave=False,
+                      mininterval=1.0,  # Update at least every 1 second
+                      maxinterval=1.0):  # Update at most every 1 second
         try:
             mol = Chem.MolFromSmiles(smiles)
             if mol is not None:
@@ -412,7 +525,14 @@ def vocab_filter_worker_function(args):
     filtered_smiles = []
     from tqdm import tqdm
     
-    for smiles in tqdm(smiles_list, desc=f"Vocab Filter Worker {worker_id}", position=worker_id, leave=True):
+    # Add space for single-digit worker IDs to align progress bars
+    worker_display = f" {worker_id}" if worker_id < 10 else str(worker_id)
+    for smiles in tqdm(smiles_list, 
+                      desc=f"Vocab Filter Worker {worker_display}", 
+                      position=worker_id, 
+                      leave=False,
+                      mininterval=1.0,  # Update at least every 1 second
+                      maxinterval=1.0):  # Update at most every 1 second
         try:
             mol_vocab = vocab_hgraph(smiles)
             # We'll check against vocab later in the main process
@@ -427,6 +547,8 @@ def encode_molecules(
     output_file: str,
     ncpu: int,
     encoding_type: str,
+    batch_size: int = None,
+    training_batch_size: int = 50,
     **kwargs
 ) -> None:
     """
@@ -438,9 +560,17 @@ def encode_molecules(
         output_file: Path to output file for tensor data
         ncpu: Number of CPU cores to use
         encoding_type: Type of encoding to use
+        batch_size: Batch size for tensorization
+        training_batch_size: Number of tensors to group into each training batch
         **kwargs: Additional arguments
     """
     print(f"Getting tensors for molecules from {input_file} using {vocab_file} as vocabulary")
+    
+    # Try to increase file descriptor limit
+    increase_file_descriptor_limit()
+    
+    # Calculate optimal number of workers to prevent file descriptor issues
+    optimal_ncpu = get_optimal_worker_count(ncpu)
     
     with open(input_file, 'r') as f:
         data = [mol.strip() for line in f for mol in line.split()[:1]]  # Take only first column
@@ -459,11 +589,11 @@ def encode_molecules(
     print(f"Loaded vocabulary with {len(vocab_data.vocab)} items")
 
     # Use multiprocessing for preprocessing only (SMILES validation and canonicalization)
-    if ncpu > 1 and len(data) > 100:
-        print(f"Using multiprocessing for preprocessing with {ncpu} workers")
+    if optimal_ncpu > 1 and len(data) > 100:
+        print(f"Using multiprocessing for preprocessing with {optimal_ncpu} workers")
         
-        # Split data into exactly ncpu chunks for optimal parallelization
-        num_chunks = ncpu
+        # Split data into exactly optimal_ncpu chunks for optimal parallelization
+        num_chunks = optimal_ncpu
         chunk_size = max(1, len(data) // num_chunks)
         data_chunks = []
         
@@ -477,7 +607,7 @@ def encode_molecules(
         # Use multiprocessing for preprocessing only
         pool = None
         try:
-            pool = Pool(ncpu)
+            pool = Pool(optimal_ncpu)
             _active_pools.append(pool)
             
             # Process chunks with timeout
@@ -499,7 +629,10 @@ def encode_molecules(
             print("Falling back to single-threaded preprocessing...")
             # Fallback to single-threaded preprocessing
             valid_molecules = []
-            for smiles in tqdm(data, desc="Preprocessing (fallback)"):
+            for smiles in tqdm(data, 
+                              desc="Preprocessing (fallback)",
+                              mininterval=1.0,  # Update at least every 1 second
+                              maxinterval=1.0):  # Update at most every 1 second
                 try:
                     mol = Chem.MolFromSmiles(smiles)
                     if mol is not None:
@@ -521,7 +654,10 @@ def encode_molecules(
         # Single-threaded preprocessing
         print("Using single-threaded preprocessing")
         valid_molecules = []
-        for smiles in tqdm(data, desc="Preprocessing"):
+        for smiles in tqdm(data, 
+                          desc="Preprocessing",
+                          mininterval=1.0,  # Update at least every 1 second
+                          maxinterval=1.0):  # Update at most every 1 second
             try:
                 mol = Chem.MolFromSmiles(smiles)
                 if mol is not None:
@@ -533,11 +669,11 @@ def encode_molecules(
     
     # Filter molecules that are in vocabulary using multiprocessing
     print("Filtering molecules by vocabulary...")
-    if ncpu > 1 and len(valid_molecules) > 100:
-        print(f"Using multiprocessing for vocabulary filtering with {ncpu} workers")
+    if optimal_ncpu > 1 and len(valid_molecules) > 100:
+        print(f"Using multiprocessing for vocabulary filtering with {optimal_ncpu} workers")
         
-        # Split valid molecules into exactly ncpu chunks for optimal parallelization
-        num_chunks = ncpu
+        # Split valid molecules into exactly optimal_ncpu chunks for optimal parallelization
+        num_chunks = optimal_ncpu
         chunk_size = max(1, len(valid_molecules) // num_chunks)
         vocab_chunks = []
         
@@ -551,7 +687,7 @@ def encode_molecules(
         # Use multiprocessing for vocabulary filtering
         pool = None
         try:
-            pool = Pool(ncpu)
+            pool = Pool(optimal_ncpu)
             _active_pools.append(pool)
             
             # Process chunks with timeout
@@ -565,7 +701,10 @@ def encode_molecules(
             final_molecules = []
             vocab_set = set(vocab_data.vocab)
             
-            for chunk_result in tqdm(vocab_results, desc="Combining vocabulary results"):
+            for chunk_result in tqdm(vocab_results, 
+                                    desc="Combining vocabulary results",
+                                    mininterval=1.0,  # Update at least every 1 second
+                                    maxinterval=1.0):  # Update at most every 1 second
                 for smiles, mol_vocab in chunk_result:
                     if mol_vocab.issubset(vocab_set):
                         final_molecules.append(smiles)
@@ -577,7 +716,10 @@ def encode_molecules(
             print("Falling back to single-threaded vocabulary filtering...")
             # Fallback to single-threaded vocabulary filtering
             final_molecules = []
-            for smiles in tqdm(valid_molecules, desc="Vocabulary filtering (fallback)"):
+            for smiles in tqdm(valid_molecules, 
+                              desc="Vocabulary filtering (fallback)",
+                              mininterval=1.0,  # Update at least every 1 second
+                              maxinterval=1.0):  # Update at most every 1 second
                 try:
                     mol_vocab = vocab_hgraph(smiles)
                     if mol_vocab.issubset(set(vocab_data.vocab)):
@@ -597,7 +739,10 @@ def encode_molecules(
         # Single-threaded vocabulary filtering
         print("Using single-threaded vocabulary filtering")
         final_molecules = []
-        for smiles in tqdm(valid_molecules, desc="Vocabulary filtering"):
+        for smiles in tqdm(valid_molecules, 
+                          desc="Vocabulary filtering",
+                          mininterval=1.0,  # Update at least every 1 second
+                          maxinterval=1.0):  # Update at most every 1 second
             try:
                 mol_vocab = vocab_hgraph(smiles)
                 if mol_vocab.issubset(set(vocab_data.vocab)):
@@ -611,94 +756,126 @@ def encode_molecules(
     if final_molecules and encoding_type == "hgraph_tensor":
         print("Tensorizing molecules...")
         try:
-            # Create exactly ncpu batches for optimal parallelization
-            num_batches = ncpu
-            batch_size = max(1, len(final_molecules) // num_batches)
-            batches = []
+            # Group molecules into batches and tensorize each batch
+            molecules_per_batch = training_batch_size  # Number of molecules per batch
+            num_batches = (len(final_molecules) + molecules_per_batch - 1) // molecules_per_batch
             
+            print(f"Grouping {len(final_molecules)} molecules into {num_batches} batches of ~{molecules_per_batch} molecules each...")
+            
+            # Create output directory
+            base_output = output_file.rsplit('.', 1)[0] if '.' in output_file else output_file
+            output_dir = f"{base_output}_processed"
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Prepare batches for multiprocessing
+            batch_data = []
             for i in range(num_batches):
-                start_idx = i * batch_size
-                end_idx = start_idx + batch_size if i < num_batches - 1 else len(final_molecules)
-                batch = final_molecules[start_idx:end_idx]
-                batches.append({
-                    'molecules': batch,
+                start_idx = i * molecules_per_batch
+                end_idx = min(start_idx + molecules_per_batch, len(final_molecules))
+                molecule_batch = final_molecules[start_idx:end_idx]
+                batch_data.append({
+                    'molecules': molecule_batch,
                     'batch_id': i
                 })
             
-            print(f"Processing {len(final_molecules)} molecules in {len(batches)} batches (batch size: ~{batch_size})")
-            
-            if ncpu > 1 and len(batches) > 1:
-                print(f"Using multiprocessing for tensorization with {ncpu} workers")
+            # Use multiprocessing for batch tensorization
+            # Use only half of available CPUs for tensorization to prevent memory exhaustion
+            tensorization_cpus = max(1, optimal_ncpu // 2)
+            if optimal_ncpu > 1 and len(batch_data) > 1:
+                print(f"Using multiprocessing for batch tensorization with {tensorization_cpus} workers (half of {optimal_ncpu} available CPUs)")
                 
-                # Use multiprocessing for tensorization
-                pool = None
-                try:
-                    pool = Pool(ncpu)
-                    _active_pools.append(pool)
+                # Process batches in smaller chunks to reduce memory pressure
+                chunk_size = max(1, len(batch_data) // 4)  # Process in 4 chunks
+                all_batches = []
+                
+                for chunk_idx in range(0, len(batch_data), chunk_size):
+                    chunk_end = min(chunk_idx + chunk_size, len(batch_data))
+                    batch_chunk = batch_data[chunk_idx:chunk_end]
                     
-                    # Process batches with timeout
-                    timeout = 1200  # 1200 seconds timeout for tensorization testing
-                    print(f"Starting tensorization with timeout: {timeout} seconds")
+                    print(f"Processing chunk {chunk_idx//chunk_size + 1}/{(len(batch_data) + chunk_size - 1)//chunk_size}: batches {chunk_idx}-{chunk_end-1}")
                     
-                    # Prepare arguments for worker function
-                    worker_args = [(batch_data, vocab_file, encoding_type, i) for i, batch_data in enumerate(batches)]
-                    #print(f"DEBUG: Created {len(worker_args)} worker arguments")
+                    # Use multiprocessing for batch tensorization
+                    pool = None
+                    try:
+                        pool = Pool(tensorization_cpus)
+                        _active_pools.append(pool)
+                        
+                        # Process batches with timeout
+                        timeout = 1800  # 30 minutes timeout for batch tensorization
+                        
+                        # Prepare arguments for worker function
+                        worker_args = [(batch_info, vocab_file, encoding_type, i) for i, batch_info in enumerate(batch_chunk)]
+                        
+                        async_results = pool.map_async(batch_tensorize_worker_function, worker_args)
+                        batch_results = async_results.get(timeout=timeout)
+                        
+                        # Filter out None results
+                        chunk_batches = [result for result in batch_results if result is not None]
+                        all_batches.extend(chunk_batches)
+                        
+                        print(f"Successfully created {len(chunk_batches)} batches in chunk")
+                        
+                    except Exception as e:
+                        print(f"Error in batch tensorization multiprocessing for chunk: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        print("Falling back to single-threaded batch tensorization for this chunk...")
+                        # Fallback to single-threaded tensorization
+                        chunk_batches = []
+                        for batch_info in tqdm(batch_chunk, 
+                                              desc="Batch tensorization (fallback)",
+                                              mininterval=1.0,
+                                              maxinterval=1.0):
+                            result = batch_tensorize_worker_function((batch_info, vocab_file, encoding_type, batch_info['batch_id']))
+                            if result is not None:
+                                chunk_batches.append(result)
+                        all_batches.extend(chunk_batches)
+                    finally:
+                        if pool:
+                            try:
+                                pool.close()
+                                pool.join()
+                                if pool in _active_pools:
+                                    _active_pools.remove(pool)
+                            except:
+                                pass
                     
-                    #print("DEBUG: Calling pool.map_async...")
-                    async_results = pool.map_async(tensorize_worker_function, worker_args)
-                    #print("DEBUG: pool.map_async called successfully")
-                    
-                    #print("DEBUG: Waiting for results with timeout...")
-                    batch_results = async_results.get(timeout=timeout)
-                    #print("DEBUG: Got results from multiprocessing")
-                    
-                    # Combine results
-                    all_tensors = []
-                    for result in tqdm(batch_results, desc="Combining tensorization results"):
-                        if result:
-                            all_tensors.extend(result)
-                    
-                    print(f"Generated {len(all_tensors)} tensors")
-                    
-                except Exception as e:
-                    print(f"Error in tensorization multiprocessing: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    print("Falling back to single-threaded tensorization...")
-                    # Fallback to single-threaded tensorization
-                    all_tensors = []
-                    for batch_data in tqdm(batches, desc="Tensorization (fallback)"):
-                        result = process_large_batch(batch_data, encoding_type, vocab_data)
-                        if result:
-                            all_tensors.extend(result)
-                finally:
-                    if pool:
-                        try:
-                            pool.close()
-                            pool.join()
-                            if pool in _active_pools:
-                                _active_pools.remove(pool)
-                        except:
-                            pass
+                    # Force garbage collection between chunks
+                    gc.collect()
+                
+                batches = all_batches
+                print(f"Successfully created {len(batches)} total batches")
             else:
-                # Single-threaded tensorization
-                print("Using single-threaded tensorization")
-                all_tensors = []
-                for batch_data in tqdm(batches, desc="Tensorization"):
-                    result = process_large_batch(batch_data, encoding_type, vocab_data)
-                    if result:
-                        all_tensors.extend(result)
+                # Single-threaded batch tensorization
+                print("Using single-threaded batch tensorization")
+                batches = []
+                for batch_info in tqdm(batch_data, 
+                                      desc="Batch tensorization",
+                                      mininterval=1.0,
+                                      maxinterval=1.0):
+                    result = batch_tensorize_worker_function((batch_info, vocab_file, encoding_type, batch_info['batch_id']))
+                    if result is not None:
+                        batches.append(result)
             
-            print(f"Generated {len(all_tensors)} tensors")
+            # Save batches as multiple files (each file contains a list of batches)
+            # DataFolder expects multiple .pkl files, each containing a list of batches
+            batches_per_file = 10  # Each file will contain 10 batches
+            num_files = (len(batches) + batches_per_file - 1) // batches_per_file
             
-            # Save results
-            base_output = output_file.rsplit('.', 1)[0] if '.' in output_file else output_file
-            tensor_file = f"{base_output}_tensors.pkl"
-            print(f"Saving tensors to {tensor_file}...")
-            with open(tensor_file, 'wb') as f:
-                pickle.dump(all_tensors, f)
+            print(f"Saving {len(batches)} batches to {num_files} files ({batches_per_file} batches per file)...")
             
-            print(f"Tensors saved to {tensor_file}")
+            for file_idx in range(num_files):
+                start_idx = file_idx * batches_per_file
+                end_idx = min(start_idx + batches_per_file, len(batches))
+                file_batches = batches[start_idx:end_idx]
+                
+                file_path = os.path.join(output_dir, f"batch_{file_idx:04d}.pkl")
+                with open(file_path, 'wb') as f:
+                    pickle.dump(file_batches, f)
+                
+                print(f"Saved file {file_idx+1}/{num_files}: {len(file_batches)} batches")
+            
+            print(f"Saved {len(batches)} total batches across {num_files} files")
             print("Tensor generation completed successfully!")
             
         except Exception as e:
@@ -741,6 +918,17 @@ def main():
         help="Number of CPU cores to use for parallel processing (default: 32)"
     )
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        help="Batch size for tensorization"
+    )
+    parser.add_argument(
+        "--training-batch-size",
+        type=int,
+        default=50,
+        help="Number of tensors to group into each training batch"
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"forge-encode {forge_encode.__version__}"
@@ -754,7 +942,9 @@ def main():
             vocab_file=args.vocab_file,
             output_file=args.output_file,
             ncpu=args.ncpu,
-            encoding_type=args.encoding_type
+            encoding_type=args.encoding_type,
+            batch_size=args.batch_size,
+            training_batch_size=args.training_batch_size
         )
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)

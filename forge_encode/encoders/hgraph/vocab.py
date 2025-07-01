@@ -58,7 +58,7 @@ class PairVocab(object):
         return len(self.hvocab), len(self.vocab)
 
     def get_mask(self, cls_idx):
-        return self.mask.index_select(index=cls_idx, dim=0)
+        return self.mask.index_select(index=cls_idx.to(self.mask.device), dim=0)
 
     def get_inter_size(self, icls_idx):
         return self.inter_size[icls_idx]

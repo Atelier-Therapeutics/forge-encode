@@ -55,6 +55,9 @@ def zip_tensors(tup_list):
 
 def index_scatter(sub_data, all_data, index):
     d0, d1 = all_data.size()
+    device = all_data.device
+    index = index.to(device)
+    sub_data = sub_data.to(device)
     buf = torch.zeros_like(all_data).scatter_(0, index.repeat(d1, 1).t(), sub_data)
     mask = torch.ones(d0, device=all_data.device).scatter_(0, index, 0)
     return all_data * mask.unsqueeze(-1) + buf
