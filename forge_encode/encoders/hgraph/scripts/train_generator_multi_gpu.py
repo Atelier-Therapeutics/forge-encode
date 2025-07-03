@@ -20,7 +20,7 @@ project_root = os.path.abspath(os.path.join(current_dir, '..', '..', '..', '..')
 sys.path.insert(0, project_root)
 
 # Now import the modules
-from forge_encode.encoders.hgraph.hgnn import HierVAE
+from forge_encode.encoders.hgraph.hgnn import HierVAE, make_cuda
 from forge_encode.encoders.hgraph.vocab import PairVocab, common_atom_vocab
 from forge_encode.encoders.hgraph.dataset import MoleculeDataset, DataFolder
 
@@ -163,7 +163,19 @@ def train_worker(rank, world_size, args):
                     print(f"DEBUG: First order length: {len(orders[0])}")
             
             loss, kl_div, wacc, iacc, tacc, sacc = model(graphs, tensors, orders, beta=beta)
-            
+            debug = True
+            if debug:
+                with torch.no_grad():
+                    tree_tensors, graph_tensors = tensors = make_cuda(tensors)
+                    root_vecs, tree_vecs, _, graph_vecs = model.module.encoder(tree_tensors, graph_tensors)
+                    z_mean = model.module.R_mean(root_vecs)  # No perturbation = mean of distribution
+                    latent_vectors = z_mean.cpu().numpy()
+                    
+                    # Now you have latent_vectors for this batch
+                    print(f"Batch latent vectors shape: {latent_vectors.shape}")
+                    print(f"First molecule latent vector: {latent_vectors[0][:5]}")  # First 5 dimensions
+
+
             # Sum loss across GPUs if it's a tensor
             if loss.dim() > 0:
                 loss = loss.sum()

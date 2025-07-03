@@ -118,9 +118,14 @@ class HierMPNEncoder(nn.Module):
         hmess = torch.cat([fmess1, fmess2, fpos], dim=-1)
         return hnode, hmess, agraph, bgraph
 
-    def embed_root(self, hmess, tree_tensors, roots):
+    def embed_root(self, hmess, tree_tensors, roots, hnode=None):
         roots = tree_tensors[2].new_tensor(roots) 
-        fnode = tree_tensors[0].index_select(0, roots)
+        if hnode is not None:
+            # Use processed node features if provided
+            fnode = hnode.index_select(0, roots)
+        else:
+            # Fallback to raw features (for backward compatibility)
+            fnode = tree_tensors[0].index_select(0, roots)
         agraph = tree_tensors[2].index_select(0, roots)
 
         nei_message = index_select_ND(hmess, 0, agraph)
@@ -137,7 +142,7 @@ class HierMPNEncoder(nn.Module):
 
         tensors = self.embed_tree(tree_tensors, hinter)
         hnode,hmess = self.tree_encoder(*tensors)
-        hroot = self.embed_root(hmess, tensors, [st for st,le in tree_tensors[-1]])
+        hroot = self.embed_root(hmess, tensors, [st for st,le in tree_tensors[-1]], hnode)
 
         return hroot, hnode, hinter, hatom
 

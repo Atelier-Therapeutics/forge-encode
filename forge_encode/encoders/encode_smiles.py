@@ -165,6 +165,21 @@ class SMILESEncoder:
         model = model.to(device)
         model.eval()
         
+        print(f"[DEBUG] Model training mode: {model.training}")
+        print(f"[DEBUG] R_mean layer parameters:")
+        for name, param in model.R_mean.named_parameters():
+            print(f"  {name}: {param.data.flatten()[:5]}")
+        
+        print(f"[DEBUG] Encoder parameters (first few):")
+        encoder_param_count = 0
+        for name, param in model.encoder.named_parameters():
+            if encoder_param_count < 3:  # Only show first 3 parameters
+                print(f"  {name}: {param.data.flatten()[:5]}")
+                encoder_param_count += 1
+            else:
+                break
+        print(f"  ... (total encoder parameters: {sum(p.numel() for p in model.encoder.parameters())})")
+        
         return model, device, model_params
     
     def canonicalize_smiles(self, smiles: str) -> Optional[str]:
@@ -213,8 +228,8 @@ class SMILESEncoder:
         return all_latent_vectors
     
     def _encode_smiles_batch(self, smiles_list: List[str]) -> List[np.ndarray]:
-        """Encode a batch of SMILES strings to latent vectors."""
-        # Preprocess SMILES
+        """Encode a batch of SMILES strings to latent vectors using the same pipeline as training."""
+        # Preprocess SMILES (same as in training)
         valid_smiles = []
         valid_indices = []
         
@@ -227,29 +242,42 @@ class SMILESEncoder:
         if not valid_smiles:
             return []
         
-        # Convert to tensors
-        try:
-            graphs, tensors, orders = MolGraph.tensorize(valid_smiles, self.model.vocab, common_atom_vocab, show_progress=False)
-        except Exception as e:
-            print(f"Error tensorizing molecules: {e}")
-            return []
+        # Process each SMILES individually to create batches of size 1 (same as training)
+        latent_vectors = []
+        processed_count = 0
         
-        # Move tensors to device
-        tree_tensors, graph_tensors = tensors = make_cuda(tensors)
-        
-        # Encode to get latent vectors
-        with torch.no_grad():
-            root_vecs, tree_vecs, _, graph_vecs = self.model.encoder(tree_tensors, graph_tensors)
-            # Get the mean of the latent distribution (no sampling)
-            z_mean = self.model.R_mean(root_vecs)
-        
-        # Convert to numpy
-        latent_vectors = z_mean.cpu().numpy()
+        for i, smiles in enumerate(valid_smiles):
+            try:
+                # Tensorize the single molecule (same as MolGraph.tensorize in training)
+                graphs, tensors, orders = MolGraph.tensorize([smiles], self.model.vocab, common_atom_vocab, show_progress=False)
+                
+                # Move tensors to device (same as make_cuda in training)
+                tree_tensors, graph_tensors = tensors = make_cuda(tensors)
+                
+                # Encode to get latent vectors (same as model.encoder in training)
+                with torch.no_grad():
+                    root_vecs, tree_vecs, _, graph_vecs = self.model.encoder(tree_tensors, graph_tensors)
+                    
+                    # Get the mean of the latent distribution (no sampling, same as training)
+                    z_mean = self.model.R_mean(root_vecs)
+                    latent_vector = z_mean.cpu().numpy()[0]  # Take first (and only) molecule
+                    
+                    latent_vectors.append(latent_vector)
+                    processed_count += 1
+                    
+                    print(f"[DEBUG] Processed SMILES {i+1}/{len(valid_smiles)}: {smiles}")
+                    print(f"  Latent vector (first 5 dims): {latent_vector[:5]}")
+                    
+            except Exception as e:
+                print(f"Error processing SMILES {smiles}: {e}")
+                latent_vectors.append(None)
+                continue
         
         # Return vectors in original order
         result = [None] * len(smiles_list)
         for i, idx in enumerate(valid_indices):
-            result[idx] = latent_vectors[i]
+            if i < len(latent_vectors):
+                result[idx] = latent_vectors[i]
         
         return [vec for vec in result if vec is not None]
 
@@ -313,7 +341,7 @@ def load_model(model_path, vocab_path):
     args = Args(model_params, vocab_obj)
     
     # Create model
-    model = HierVAE(args)
+    model = HierVAE(args).cuda(f'cuda:{torch.cuda.current_device()}')
     
     # Load state dict
     model.load_state_dict(model_state)
@@ -322,6 +350,10 @@ def load_model(model_path, vocab_path):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     model.eval()
+    
+    for name, param in model.R_mean.named_parameters():
+        print(f"  {name}: {param.data.flatten()[:5]}")
+    
     
     return model, device, model_params
 
@@ -354,13 +386,14 @@ def generate_uuid_for_smiles(identifier: str) -> str:
     return f"{identifier}-{uuid_str}"
 
 def encode_smiles_batch(model, smiles_list, device, vocab, atom_vocab):
-    """Encode a batch of SMILES strings to latent vectors."""
-    # Preprocess SMILES
+    """Encode a batch of SMILES strings to latent vectors using the same pipeline as training."""
+    # Preprocess SMILES (same as in training)
     valid_smiles = []
     valid_indices = []
     
     for i, smiles in enumerate(smiles_list):
         canonical = canonicalize_smiles(smiles)
+        print(f"[DEBUG] Original: {smiles} | Canonical: {canonical}")
         if canonical is not None:
             valid_smiles.append(canonical)
             valid_indices.append(i)
@@ -368,34 +401,46 @@ def encode_smiles_batch(model, smiles_list, device, vocab, atom_vocab):
     if not valid_smiles:
         return [], []
     
-    # Convert to tensors
-    try:
-        graphs, tensors, orders = MolGraph.tensorize(valid_smiles, vocab, atom_vocab, show_progress=False)
-    except Exception as e:
-        print(f"Error tensorizing molecules: {e}")
-        return [], []
+    # Process each SMILES individually to create batches of size 1 (same as training)
+    latent_vectors = []
     
-    # Move tensors to device
-    tree_tensors, graph_tensors = tensors = make_cuda(tensors)
-    
-    # Encode to get latent vectors
-    with torch.no_grad():
-        root_vecs, tree_vecs, _, graph_vecs = model.encoder(tree_tensors, graph_tensors)
-        # Get the mean of the latent distribution (no sampling)
-        z_mean = model.R_mean(root_vecs)
-    
-    # Convert to numpy
-    latent_vectors = z_mean.cpu().numpy()
+    for i, smiles in enumerate(valid_smiles):
+        try:
+            # Tensorize the single molecule (same as MolGraph.tensorize in training)
+            graphs, tensors, orders = MolGraph.tensorize([smiles], vocab, atom_vocab, show_progress=False)
+            
+            
+            _, _, _, _, _, _ = model(graphs, tensors, orders, beta=0.0)
+            
+            # Encode to get latent vectors (same as model.encoder in training)
+            with torch.no_grad():
+                tree_tensors, graph_tensors = tensors = make_cuda(tensors)
+                root_vecs, tree_vecs, _, graph_vecs = model.encoder(tree_tensors, graph_tensors)
+                
+                # Get the mean of the latent distribution (no sampling, same as training)
+                z_mean = model.R_mean(root_vecs)
+                latent_vector = z_mean.cpu().numpy()[0]  # Take first (and only) molecule
+                
+                latent_vectors.append(latent_vector)
+                
+                print(f"[DEBUG] Processed SMILES {i+1}/{len(valid_smiles)}: {smiles}")
+                print(f"  Latent vector (first 5 dims): {latent_vector[:5]}")
+                
+        except Exception as e:
+            print(f"Error processing SMILES {smiles}: {e}")
+            latent_vectors.append(None)
+            continue
     
     return latent_vectors, valid_indices
 
 
 def main():
     """Main function for command-line usage."""
-    parser = argparse.ArgumentParser(description='Encode SMILES strings to latent vectors')
+    parser = argparse.ArgumentParser(description='Encode SMILES strings to latent vectors. Provide SMILES via --smiles parameter or --input file.')
     parser.add_argument('--model', required=True, help='Path to trained model checkpoint')
     parser.add_argument('--vocab', required=True, help='Path to vocabulary file')
-    parser.add_argument('--input', required=True, help='Input file with SMILES (one per line) or comma-separated SMILES string')
+    parser.add_argument('--input', help='Input file with SMILES (one per line) or comma-separated SMILES string (alternative to --smiles)')
+    parser.add_argument('--smiles', help='Comma-separated list of SMILES strings')
     parser.add_argument('--output', required=True, help='Output file for latent vectors (JSON format)')
     parser.add_argument('--identifier', required=True, choices=['ATLX', 'RCSB'], 
                        help='Four-letter identifier (ATLX or RCSB)')
@@ -417,14 +462,25 @@ def main():
     np.random.seed(seed)
     torch.manual_seed(seed)
     
-    # Check if input is a file or direct SMILES string
-    if os.path.exists(args.input):
-        # Read SMILES from file
-        with open(args.input, 'r') as f:
-            smiles_list = [line.strip() for line in f if line.strip()]
+    # Check if input is provided via --smiles or --input
+    if args.smiles:
+        # Use SMILES from command line argument
+        smiles_list = [s.strip() for s in args.smiles.split(',') if s.strip()]
+        print(f"Using {len(smiles_list)} SMILES strings from --smiles parameter")
+    elif args.input:
+        # Check if input is a file or direct SMILES string
+        if os.path.exists(args.input):
+            # Read SMILES from file
+            with open(args.input, 'r') as f:
+                smiles_list = [line.strip() for line in f if line.strip()]
+            print(f"Read {len(smiles_list)} SMILES strings from file: {args.input}")
+        else:
+            # Treat as comma-separated SMILES string
+            smiles_list = [s.strip() for s in args.input.split(',') if s.strip()]
+            print(f"Using {len(smiles_list)} SMILES strings from --input parameter")
     else:
-        # Treat as comma-separated SMILES string
-        smiles_list = [s.strip() for s in args.input.split(',') if s.strip()]
+        # Neither --smiles nor --input provided
+        parser.error("Either --smiles or --input must be provided")
     
     print(f"Processing {len(smiles_list)} SMILES strings...")
     
@@ -435,8 +491,8 @@ def main():
     print(f"Model architecture: hidden_size={model_params['hidden_size']}, "
           f"embed_size={model_params['embed_size']}, latent_size={model_params['latent_size']}")
     
-    # Process in batches and create results dictionary
-    results = {}
+    # Process in batches and create results list
+    results = []
     
     for i in tqdm(range(0, len(smiles_list), args.batch_size), desc="Encoding batches"):
         batch_smiles = smiles_list[i:i + args.batch_size]
@@ -450,40 +506,92 @@ def main():
             # Generate unique ID for this SMILES
             unique_id = generate_uuid_for_smiles(args.identifier)
             
+            # Create molecule entries list
+            molecule_entries = []
+            
             # Check if this SMILES was successfully encoded
             if j in valid_indices:
                 # Find the corresponding latent vector
                 vec_idx = valid_indices.index(j)
                 latent_vector = latent_vectors[vec_idx]
                 
-                results[unique_id] = {
-                    'smiles': smiles,
-                    'latent_vector': latent_vector.tolist(),
-                    'model': os.path.basename(args.model),
-                    'model_parameters': model_params
-                }
+                # Create entries in the new format
+                molecule_entries.extend([
+                    {
+                        "key": "unique_id",
+                        "value": unique_id,
+                        "access_level": 2,
+                        "description": "Unique identifier for this molecular encoding"
+                    },
+                    {
+                        "key": "smiles",
+                        "value": smiles,
+                        "access_level": 1,
+                        "description": f"Molecular SMILES string (ID: {unique_id})"
+                    },
+                    {
+                        "key": "latent_vector",
+                        "value": latent_vector.tolist(),
+                        "access_level": 2,
+                        "description": "Latent vector for ML training"
+                    },
+                    {
+                        "key": "model",
+                        "value": os.path.basename(args.model),
+                        "access_level": 2,
+                        "description": "Model identifier"
+                    },
+                    {
+                        "key": "model_parameters",
+                        "value": model_params,
+                        "access_level": 2,
+                        "description": "Model parameters"
+                    }
+                ])
             else:
-                # Failed encoding
-                results[unique_id] = {
-                    'smiles': smiles,
-                    'latent_vector': None,
-                    'model': os.path.basename(args.model),
-                    'model_parameters': model_params
-                }
+                # Failed encoding - only include SMILES and model info
+                molecule_entries.extend([
+                    {
+                        "key": "unique_id",
+                        "value": unique_id,
+                        "access_level": 2,
+                        "description": "Unique identifier for this molecular encoding"
+                    },
+                    {
+                        "key": "smiles",
+                        "value": smiles,
+                        "access_level": 1,
+                        "description": f"Molecular SMILES string (ID: {unique_id}) - Failed encoding"
+                    },
+                    {
+                        "key": "model",
+                        "value": os.path.basename(args.model),
+                        "access_level": 2,
+                        "description": "Model identifier"
+                    },
+                    {
+                        "key": "model_parameters",
+                        "value": model_params,
+                        "access_level": 2,
+                        "description": "Model parameters"
+                    }
+                ])
+            
+            # Add the molecule entries list to results
+            results.append(molecule_entries)
     
     # Save results
     with open(args.output, 'w') as f:
         json.dump(results, f, indent=2)
     
-    successful_count = sum(1 for v in results.values() if v['latent_vector'] is not None)
-    failed_count = len(results) - successful_count
+    successful_count = sum(1 for molecule in results if any(item['key'] == 'latent_vector' for item in molecule))
+    failed_count = len(smiles_list) - successful_count
     
     print(f"Successfully encoded {successful_count} out of {len(smiles_list)} SMILES strings")
     print(f"Failed encodings: {failed_count}")
     print(f"Results saved to {args.output}")
     print(f"Latent vector shape: {model_params['latent_size']}")
-    print(f"Output format: Dictionary with {len(results)} entries")
-
+    print(f"Output format: List with {len(results)} entries")
 
 if __name__ == "__main__":
     main() 
