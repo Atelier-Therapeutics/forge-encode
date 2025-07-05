@@ -3,6 +3,7 @@
 Script and module for encoding SMILES strings to latent vectors using a trained HierVAE model.
 
 This module can be used both as a command-line script and as an importable Python module.
+Supports both GPU and CPU-only environments.
 
 Command-line usage:
     python encode_smiles.py --model model.ckpt --vocab vocab.txt --input smiles.txt --output results.json --identifier ATLX
@@ -12,6 +13,11 @@ The script generates a JSON dictionary where:
 - Values contain SMILES, latent vector, model path, and model parameters
 - Failed encodings have latent_vector set to None
 - Seeds are auto-generated from machine ID + date for reproducibility (can be overridden with --seed)
+
+Device support:
+- Automatically detects and uses GPU if available
+- Falls back to CPU if no GPU is available (slower but functional)
+- No manual device configuration required
 
 Python usage:
     from forge_encode.encoders.encode_smiles import SMILESEncoder, encode_smiles
@@ -160,12 +166,10 @@ class SMILESEncoder:
         # Load state dict
         model.load_state_dict(model_state)
         
-        # Move to device
+        # Move to device (handle CPU-only environments)
         device = torch.device(self.device)
         model = model.to(device)
         model.eval()
-        
-
         
         return model, device, model_params
     
@@ -252,8 +256,6 @@ class SMILESEncoder:
                     latent_vectors.append(latent_vector)
                     processed_count += 1
                     
-
-                    
             except Exception as e:
                 print(f"Error processing SMILES {smiles}: {e}")
                 latent_vectors.append(None)
@@ -327,18 +329,15 @@ def load_model(model_path, vocab_path):
     args = Args(model_params, vocab_obj)
     
     # Create model
-    model = HierVAE(args).cuda(f'cuda:{torch.cuda.current_device()}')
+    model = HierVAE(args)
     
     # Load state dict
     model.load_state_dict(model_state)
     
-    # Move to GPU if available
+    # Move to device (CPU or GPU)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     model.eval()
-    
-    
-    
     
     return model, device, model_params
 
@@ -394,7 +393,6 @@ def encode_smiles_batch(model, smiles_list, device, vocab, atom_vocab):
             # Tensorize the single molecule (same as MolGraph.tensorize in training)
             graphs, tensors, orders = MolGraph.tensorize([smiles], vocab, atom_vocab, show_progress=False)
             
-            
             # Encode to get latent vectors (same as model.encoder in training)
             with torch.no_grad():
                 tree_tensors, graph_tensors = tensors = make_cuda(tensors)
@@ -405,8 +403,6 @@ def encode_smiles_batch(model, smiles_list, device, vocab, atom_vocab):
                 latent_vector = z_mean.cpu().numpy()[0]  # Take first (and only) molecule
                 
                 latent_vectors.append(latent_vector)
-                
-
                 
         except Exception as e:
             print(f"Error processing SMILES {smiles}: {e}")
@@ -444,6 +440,13 @@ def main():
     np.random.seed(seed)
     torch.manual_seed(seed)
     
+    # Check device availability
+    if torch.cuda.is_available():
+        print(f"CUDA is available. Using GPU: {torch.cuda.get_device_name()}")
+    else:
+        print("CUDA is not available. Using CPU for computation.")
+        print("Note: CPU computation will be slower than GPU.")
+    
     # Check if input is provided via --smiles or --input
     if args.smiles:
         # Use SMILES from command line argument
@@ -468,10 +471,15 @@ def main():
     
     # Load model and infer parameters
     print("Loading model and inferring parameters...")
-    model, device, model_params = load_model(args.model, args.vocab)
-    print(f"Model loaded on device: {device}")
-    print(f"Model architecture: hidden_size={model_params['hidden_size']}, "
-          f"embed_size={model_params['embed_size']}, latent_size={model_params['latent_size']}")
+    try:
+        model, device, model_params = load_model(args.model, args.vocab)
+        print(f"Model loaded on device: {device}")
+        print(f"Model architecture: hidden_size={model_params['hidden_size']}, "
+              f"embed_size={model_params['embed_size']}, latent_size={model_params['latent_size']}")
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        print("Make sure the model checkpoint and vocabulary files exist and are accessible.")
+        return
     
     # Process in batches and create results list
     results = []
