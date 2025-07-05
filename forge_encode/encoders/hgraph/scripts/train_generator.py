@@ -60,7 +60,9 @@ random.seed(args.seed)
 vocab = [x.strip("\r\n ").split() for x in open(args.vocab)] 
 args.vocab = PairVocab(vocab)
 
-model = HierVAE(args).cuda()
+# Create model on appropriate device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = HierVAE(args).to(device)
 print("Model #Params: %dK" % (sum([x.nelement() for x in model.parameters()]) / 1000,))
 
 for param in model.parameters():

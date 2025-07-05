@@ -48,7 +48,9 @@ def zip_tensors(tup_list):
     tup_list = zip(*tup_list)
     for a in tup_list:
         if type(a[0]) is int: 
-            res.append( torch.LongTensor(a).cuda() )
+            # Create tensor on appropriate device
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            res.append( torch.LongTensor(a).to(device) )
         else:
             res.append( torch.stack(a, dim=0) )
     return res
