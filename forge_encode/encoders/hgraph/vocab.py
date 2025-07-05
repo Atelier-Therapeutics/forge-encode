@@ -26,7 +26,7 @@ class Vocab(object):
 
 class PairVocab(object):
 
-    def __init__(self, smiles_pairs, cuda=True):
+    def __init__(self, smiles_pairs, cuda=None):
         cls = list(zip(*smiles_pairs))[0]
         self.hvocab = sorted( list(set(cls)) )
         self.hmap = {x:i for i,x in enumerate(self.hvocab)}
@@ -41,7 +41,14 @@ class PairVocab(object):
             idx = self.vmap[(h,s)]
             self.mask[hid, idx] = 1000.0
 
-        if cuda: self.mask = self.mask.cuda()
+        # Auto-detect CUDA availability if not specified
+        if cuda is None:
+            cuda = torch.cuda.is_available()
+        
+        # Move to device if CUDA is available and requested
+        if cuda and torch.cuda.is_available():
+            self.mask = self.mask.cuda()
+        
         self.mask = self.mask - 1000.0
             
     def __getitem__(self, x):

@@ -141,7 +141,9 @@ class SMILESEncoder:
         # Load vocabulary
         with open(self.vocab_path, 'r') as f:
             vocab = [x.strip("\r\n ").split() for x in f]
-        vocab_obj = PairVocab(vocab)
+        # Pass device information to PairVocab
+        use_cuda = self.device == 'cuda' and torch.cuda.is_available()
+        vocab_obj = PairVocab(vocab, cuda=use_cuda)
         
         # Create args object with inferred parameters
         class Args:
@@ -309,7 +311,9 @@ def load_model(model_path, vocab_path):
     
     # Load vocabulary
     vocab = [x.strip("\r\n ").split() for x in open(vocab_path)]
-    vocab_obj = PairVocab(vocab)
+    # Check device availability for vocabulary
+    use_cuda = torch.cuda.is_available()
+    vocab_obj = PairVocab(vocab, cuda=use_cuda)
     
     # Create args object with inferred parameters
     class Args:
