@@ -163,7 +163,7 @@ def train_worker(rank, world_size, args):
                     print(f"DEBUG: First order length: {len(orders[0])}")
             
             loss, kl_div, wacc, iacc, tacc, sacc = model(graphs, tensors, orders, beta=beta)
-            debug = True
+            debug = False
             if debug:
                 with torch.no_grad():
                     tree_tensors, graph_tensors = tensors = make_cuda(tensors)

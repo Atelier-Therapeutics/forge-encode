@@ -111,21 +111,17 @@ class HierMPNEncoder(nn.Module):
         fnode, fmess, agraph, bgraph, _ = graph_tensors
         # Ensure embedding matrices are on the same device as input tensors
         device = fnode.device
-        hnode = self.E_a.to(device).index_select(index=fnode, dim=0)
-        fmess1 = hnode.index_select(index=fmess[:, 0], dim=0)
-        fmess2 = self.E_b.to(device).index_select(index=fmess[:, 2], dim=0)
-        fpos = self.E_apos.to(device).index_select(index=fmess[:, 3], dim=0)
-        hmess = torch.cat([fmess1, fmess2, fpos], dim=-1)
+        hnode = self.E_a.to(device).index_select(index=fnode, dim=0) # embed atom types as one-hot vectors
+        fmess1 = hnode.index_select(index=fmess[:, 0], dim=0) # embed source atom index for each bond in the message
+        fmess2 = self.E_b.to(device).index_select(index=fmess[:, 2], dim=0) # embed bond type for each bond in the message
+        fpos = self.E_apos.to(device).index_select(index=fmess[:, 3], dim=0) # embed branching (position) for each bond
+        hmess = torch.cat([fmess1, fmess2, fpos], dim=-1) # concatenate the embedded features on columns
         return hnode, hmess, agraph, bgraph
 
     def embed_root(self, hmess, tree_tensors, roots, hnode=None):
         roots = tree_tensors[2].new_tensor(roots) 
-        if hnode is not None:
-            # Use processed node features if provided
-            fnode = hnode.index_select(0, roots)
-        else:
-            # Fallback to raw features (for backward compatibility)
-            fnode = tree_tensors[0].index_select(0, roots)
+        # Use hmess[st] for each root to get the processed message features
+        fnode = torch.stack([hmess[st] for st in roots])
         agraph = tree_tensors[2].index_select(0, roots)
 
         nei_message = index_select_ND(hmess, 0, agraph)

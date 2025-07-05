@@ -165,20 +165,7 @@ class SMILESEncoder:
         model = model.to(device)
         model.eval()
         
-        print(f"[DEBUG] Model training mode: {model.training}")
-        print(f"[DEBUG] R_mean layer parameters:")
-        for name, param in model.R_mean.named_parameters():
-            print(f"  {name}: {param.data.flatten()[:5]}")
-        
-        print(f"[DEBUG] Encoder parameters (first few):")
-        encoder_param_count = 0
-        for name, param in model.encoder.named_parameters():
-            if encoder_param_count < 3:  # Only show first 3 parameters
-                print(f"  {name}: {param.data.flatten()[:5]}")
-                encoder_param_count += 1
-            else:
-                break
-        print(f"  ... (total encoder parameters: {sum(p.numel() for p in model.encoder.parameters())})")
+
         
         return model, device, model_params
     
@@ -265,8 +252,7 @@ class SMILESEncoder:
                     latent_vectors.append(latent_vector)
                     processed_count += 1
                     
-                    print(f"[DEBUG] Processed SMILES {i+1}/{len(valid_smiles)}: {smiles}")
-                    print(f"  Latent vector (first 5 dims): {latent_vector[:5]}")
+
                     
             except Exception as e:
                 print(f"Error processing SMILES {smiles}: {e}")
@@ -351,8 +337,7 @@ def load_model(model_path, vocab_path):
     model = model.to(device)
     model.eval()
     
-    for name, param in model.R_mean.named_parameters():
-        print(f"  {name}: {param.data.flatten()[:5]}")
+    
     
     
     return model, device, model_params
@@ -393,7 +378,7 @@ def encode_smiles_batch(model, smiles_list, device, vocab, atom_vocab):
     
     for i, smiles in enumerate(smiles_list):
         canonical = canonicalize_smiles(smiles)
-        print(f"[DEBUG] Original: {smiles} | Canonical: {canonical}")
+
         if canonical is not None:
             valid_smiles.append(canonical)
             valid_indices.append(i)
@@ -410,8 +395,6 @@ def encode_smiles_batch(model, smiles_list, device, vocab, atom_vocab):
             graphs, tensors, orders = MolGraph.tensorize([smiles], vocab, atom_vocab, show_progress=False)
             
             
-            _, _, _, _, _, _ = model(graphs, tensors, orders, beta=0.0)
-            
             # Encode to get latent vectors (same as model.encoder in training)
             with torch.no_grad():
                 tree_tensors, graph_tensors = tensors = make_cuda(tensors)
@@ -423,8 +406,7 @@ def encode_smiles_batch(model, smiles_list, device, vocab, atom_vocab):
                 
                 latent_vectors.append(latent_vector)
                 
-                print(f"[DEBUG] Processed SMILES {i+1}/{len(valid_smiles)}: {smiles}")
-                print(f"  Latent vector (first 5 dims): {latent_vector[:5]}")
+
                 
         except Exception as e:
             print(f"Error processing SMILES {smiles}: {e}")
@@ -580,18 +562,24 @@ def main():
             # Add the molecule entries list to results
             results.append(molecule_entries)
     
-    # Save results
-    with open(args.output, 'w') as f:
-        json.dump(results, f, indent=2)
-    
     successful_count = sum(1 for molecule in results if any(item['key'] == 'latent_vector' for item in molecule))
     failed_count = len(smiles_list) - successful_count
-    
+
     print(f"Successfully encoded {successful_count} out of {len(smiles_list)} SMILES strings")
     print(f"Failed encodings: {failed_count}")
     print(f"Results saved to {args.output}")
     print(f"Latent vector shape: {model_params['latent_size']}")
     print(f"Output format: List with {len(results)} entries")
+
+
+    if args.output == "stdout":
+        return results
+    elif args.output.endswith(".json"):
+        # Save results
+        with open(args.output, 'w') as f:
+            json.dump(results, f, indent=2)
+    
+    
 
 if __name__ == "__main__":
     main() 

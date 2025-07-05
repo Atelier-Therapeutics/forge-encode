@@ -54,17 +54,19 @@ class MolGraph(object):
             a1 = bond.GetBeginAtom().GetIdx()
             a2 = bond.GetEndAtom().GetIdx()
             if not bond.IsInRing():
-                clusters.append( (a1, a2) )
+                clusters.append( (a1, a2) ) # if bond is not in ring, add its atoms to clusters list
         
         ssr = [tuple(x) for x in Chem.GetSymmSSSR(mol)]
-        clusters.extend(ssr)
+        clusters.extend(ssr) # add all rings to clusters list
 
+        # atom index 0 containing cluster is the root cluster (position 0)
         if 0 not in clusters[0]:
             for i, cls in enumerate(clusters):
                 if 0 in cls:
                     clusters = [clusters[i]] + clusters[:i] + clusters[i+1:]
                     break
         
+        # map atom index to cluster index
         atom_cls = [[] for i in range(n_atoms)]
         for i in range(len(clusters)):
             for atom in clusters[i]:
@@ -77,15 +79,17 @@ class MolGraph(object):
         graph = nx.empty_graph( len(clusters) )
         for atom, nei_cls in enumerate(self.atom_cls):
             if len(nei_cls) <= 1: continue
-            bonds = [c for c in nei_cls if len(clusters[c]) == 2]
-            rings = [c for c in nei_cls if len(clusters[c]) > 4]
+            bonds = [c for c in nei_cls if len(clusters[c]) == 2] # if atom has 2 neighbors, it is a bond
+            rings = [c for c in nei_cls if len(clusters[c]) > 4] # if atom has more than 4 neighbors, it is a ring
 
+            # if atom has more than 2 neighbors and has at least 2 bonds, it is a bond
             if len(nei_cls) > 2 and len(bonds) >= 2:
                 clusters.append([atom])
                 c2 = len(clusters) - 1
                 graph.add_node(c2)
                 for c1 in nei_cls:
                     graph.add_edge(c1, c2, weight=100)
+            # if atom has more than 4 neighbors and has at least 2 rings, it is a ring
             elif len(rings) > 2:
                 clusters.append([atom])
                 c2 = len(clusters) - 1
